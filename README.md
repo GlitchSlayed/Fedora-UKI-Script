@@ -137,7 +137,7 @@ Run the same checks locally with:
 
 ```bash
 bash -n uki-setup.sh tests/test_uki_setup.sh
-shellcheck uki-setup.sh tests/test_uki_setup.sh
+shellcheck -P . uki-setup.sh tests/test_uki_setup.sh
 bash tests/test_uki_setup.sh
 ```
 

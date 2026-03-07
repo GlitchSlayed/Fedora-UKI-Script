@@ -11,7 +11,7 @@ cleanup() {
 trap cleanup EXIT
 
 export UKI_SETUP_SKIP_MAIN=1
-# shellcheck source=../uki-setup.sh
+# shellcheck source=uki-setup.sh
 source "$REPO_ROOT/uki-setup.sh"
 
 BUILD_SCRIPT="$TMPDIR_WORK/usr-local-sbin-uki-build.sh"

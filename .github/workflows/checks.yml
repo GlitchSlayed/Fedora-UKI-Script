@@ -29,7 +29,7 @@ jobs:
         run: bash -n uki-setup.sh tests/test_uki_setup.sh
 
       - name: ShellCheck
-        run: shellcheck uki-setup.sh tests/test_uki_setup.sh
+        run: shellcheck -P . uki-setup.sh tests/test_uki_setup.sh
 
       - name: Project checks
         run: bash tests/test_uki_setup.sh
