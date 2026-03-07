@@ -63,10 +63,10 @@ for any existing files it overwrites.
 
 ## Quick start
 
-One-line download + run from GitHub (replace `<OWNER>` with the repo owner):
+One-line download + run from GitHub:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<OWNER>/Fedora-UKI-Script/main/uki-setup.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/GlitchSlayed/Fedora-UKI-Script/main/uki-setup.sh | sudo bash
 ```
 
 1. Clone this repository.
