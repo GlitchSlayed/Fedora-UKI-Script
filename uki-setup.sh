@@ -60,6 +60,7 @@ INITRAMFS_REQUIRED_LIST="/etc/uki/initramfs-required.txt"
 INITRAMFS_FORBIDDEN_LIST="/etc/uki/initramfs-forbidden.txt"
 INITRAMFS_STATE_DIR="/var/lib/uki-build"
 INITRAMFS_STRICT_DIFF=0
+CMDLINE_MIN_TOKENS=3
 
 # =============================================================================
 # ──  SCRIPT INTERNALS  ───────────────────────────────────────────────────────
@@ -85,6 +86,83 @@ sanitize_cmdline() {
     sed -E 's/(^| )BOOT_IMAGE=[^ ]*//g; s/(^| )initrd=[^ ]*//g; s/(^| )rd\.driver\.blacklist=[^ ]*//g; s/  +/ /g; s/^ //; s/ $//'
 }
 
+count_cmdline_tokens() {
+    local cmdline="$1"
+    awk '{print NF}' <<<"$cmdline"
+}
+
+extract_root_uuid() {
+    local cmdline="$1" token
+    for token in $cmdline; do
+        if [[ "$token" =~ ^root=UUID=([^[:space:]]+)$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+major_version() {
+    local version="$1"
+    echo "${version%%.*}"
+}
+
+get_os_version_id() {
+    local version_id=""
+    if [[ -r /etc/os-release ]]; then
+        version_id=$(awk -F= '$1=="VERSION_ID" {gsub(/"/,"",$2); print $2}' /etc/os-release)
+    fi
+    echo "$version_id"
+}
+
+validate_root_uuid_against_blkid() {
+    local cmdline="$1" source="$2" detected="$3" uuid
+
+    if ! uuid=$(extract_root_uuid "$cmdline"); then
+        return 0
+    fi
+
+    if [[ "$uuid" == "REPLACE-ME" ]]; then
+        die "Refusing to continue: cmdline from ${source} still contains root=UUID=REPLACE-ME."
+    fi
+
+    if ! blkid -t "UUID=$uuid" >/dev/null 2>&1; then
+        if [[ "$detected" == "1" ]]; then
+            die "Detected cmdline from ${source} references root UUID '${uuid}', but blkid cannot find it."
+        fi
+        die "Configured cmdline references root UUID '${uuid}', but blkid cannot find it."
+    fi
+}
+
+warn_if_cmdline_short() {
+    local cmdline="$1" source="$2" token_count
+    token_count=$(count_cmdline_tokens "$cmdline")
+    if (( token_count < CMDLINE_MIN_TOKENS )); then
+        warn "Cmdline from ${source} looks unusually short after sanitization (${token_count} token(s)): ${cmdline}"
+    fi
+}
+
+persist_cmdline_metadata() {
+    local cmdline="$1" source="$2" version_id="$3"
+    local metadata_dir="${INITRAMFS_STATE_DIR}/cmdline"
+
+    mkdir -p "$metadata_dir"
+    printf '%s\n' "$cmdline" > "${metadata_dir}/effective-cmdline"
+    printf '%s\n' "$source" > "${metadata_dir}/source"
+    printf '%s\n' "$version_id" > "${metadata_dir}/version-id"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "${metadata_dir}/updated-at"
+}
+
+validate_final_cmdline() {
+    local cmdline="$1" source="$2" detected="$3"
+
+    [[ "$cmdline" =~ (^|[[:space:]])root=UUID=REPLACE-ME($|[[:space:]]) ]] \
+        && die "Refusing to build UKI with placeholder cmdline token root=UUID=REPLACE-ME."
+
+    warn_if_cmdline_short "$cmdline" "$source"
+    validate_root_uuid_against_blkid "$cmdline" "$source" "$detected"
+}
+
 read_grub_cmdline() {
     local file line value
 
@@ -104,13 +182,49 @@ read_grub_cmdline() {
 }
 
 get_effective_cmdline() {
-    local proc_cmdline kernel_cmdline grub_cmdline
+    local proc_cmdline kernel_cmdline grub_cmdline cached_cmdline
+    local cmdline_source="configured CMDLINE" detected_cmdline=0
+    local metadata_dir="${INITRAMFS_STATE_DIR}/cmdline"
+    local current_version_id cached_version_id current_major cached_major
+
+    current_version_id=$(get_os_version_id)
+    current_major=$(major_version "$current_version_id")
+
+    if [[ -r "${metadata_dir}/version-id" ]]; then
+        cached_version_id=$(<"${metadata_dir}/version-id")
+        cached_major=$(major_version "$cached_version_id")
+        if [[ -n "$cached_major" && -n "$current_major" && "$cached_major" != "$current_major" ]]; then
+            warn "Fedora major VERSION_ID changed (${cached_version_id} -> ${current_version_id}); forcing fresh cmdline detection."
+            cached_cmdline=""
+        elif [[ -r "${metadata_dir}/effective-cmdline" ]]; then
+            cached_cmdline=$(<"${metadata_dir}/effective-cmdline")
+        fi
+    elif [[ -r "${metadata_dir}/effective-cmdline" ]]; then
+        cached_cmdline=$(<"${metadata_dir}/effective-cmdline")
+    fi
 
     if [[ "$AUTO_DETECT_CMDLINE" -eq 1 ]]; then
+        if [[ -n "${cached_cmdline:-}" ]]; then
+            cached_cmdline=$(printf '%s\n' "$cached_cmdline" | sanitize_cmdline | xargs || true)
+            if [[ -n "$cached_cmdline" ]]; then
+                info "Using cached cmdline metadata from ${metadata_dir}/effective-cmdline"
+                cmdline_source="cached metadata"
+                detected_cmdline=1
+                validate_final_cmdline "$cached_cmdline" "$cmdline_source" "$detected_cmdline"
+                persist_cmdline_metadata "$cached_cmdline" "$cmdline_source" "$current_version_id"
+                echo "$cached_cmdline"
+                return 0
+            fi
+        fi
+
         if [[ -r /proc/cmdline ]]; then
             proc_cmdline=$(sanitize_cmdline < /proc/cmdline | xargs || true)
             if [[ -n "$proc_cmdline" && "$proc_cmdline" =~ (root=|rd.luks.uuid=|rootfstype=) ]]; then
                 info "Using cmdline from /proc/cmdline"
+                cmdline_source="/proc/cmdline"
+                detected_cmdline=1
+                validate_final_cmdline "$proc_cmdline" "$cmdline_source" "$detected_cmdline"
+                persist_cmdline_metadata "$proc_cmdline" "$cmdline_source" "$current_version_id"
                 echo "$proc_cmdline"
                 return 0
             fi
@@ -120,6 +234,10 @@ get_effective_cmdline() {
             kernel_cmdline=$(sanitize_cmdline < /etc/kernel/cmdline | xargs || true)
             if [[ -n "$kernel_cmdline" && "$kernel_cmdline" =~ (root=|rd.luks.uuid=|rootfstype=) ]]; then
                 info "Using cmdline from /etc/kernel/cmdline"
+                cmdline_source="/etc/kernel/cmdline"
+                detected_cmdline=1
+                validate_final_cmdline "$kernel_cmdline" "$cmdline_source" "$detected_cmdline"
+                persist_cmdline_metadata "$kernel_cmdline" "$cmdline_source" "$current_version_id"
                 echo "$kernel_cmdline"
                 return 0
             fi
@@ -130,6 +248,10 @@ get_effective_cmdline() {
             grub_cmdline=$(printf '%s\n' "$grub_cmdline" | sanitize_cmdline | xargs || true)
             if [[ -n "$grub_cmdline" && "$grub_cmdline" =~ (root=|rd.luks.uuid=|rootfstype=) ]]; then
                 info "Using cmdline from GRUB configuration"
+                cmdline_source="GRUB configuration"
+                detected_cmdline=1
+                validate_final_cmdline "$grub_cmdline" "$cmdline_source" "$detected_cmdline"
+                persist_cmdline_metadata "$grub_cmdline" "$cmdline_source" "$current_version_id"
                 echo "$grub_cmdline"
                 return 0
             fi
@@ -137,6 +259,9 @@ get_effective_cmdline() {
 
         warn "Auto-detect enabled, but no bootable cmdline was detected. Falling back to configured CMDLINE."
     fi
+
+    validate_final_cmdline "$CMDLINE" "$cmdline_source" "$detected_cmdline"
+    persist_cmdline_metadata "$CMDLINE" "$cmdline_source" "$current_version_id"
 
     echo "$CMDLINE"
 }
@@ -460,6 +585,7 @@ INITRAMFS_REQUIRED_LIST="__INITRAMFS_REQUIRED_LIST__"
 INITRAMFS_FORBIDDEN_LIST="__INITRAMFS_FORBIDDEN_LIST__"
 INITRAMFS_STATE_DIR="__INITRAMFS_STATE_DIR__"
 INITRAMFS_STRICT_DIFF=__INITRAMFS_STRICT_DIFF__
+CMDLINE_MIN_TOKENS=__CMDLINE_MIN_TOKENS__
 # ─────────────────────────────────────────────────────────────────────────────
 
 RED='\e[31;1m'; GRN='\e[32;1m'; YLW='\e[33;1m'; RST='\e[0m'
@@ -600,6 +726,83 @@ sanitize_cmdline() {
     sed -E 's/(^| )BOOT_IMAGE=[^ ]*//g; s/(^| )initrd=[^ ]*//g; s/(^| )rd\.driver\.blacklist=[^ ]*//g; s/  +/ /g; s/^ //; s/ $//'
 }
 
+count_cmdline_tokens() {
+    local cmdline="$1"
+    awk '{print NF}' <<<"$cmdline"
+}
+
+extract_root_uuid() {
+    local cmdline="$1" token
+    for token in $cmdline; do
+        if [[ "$token" =~ ^root=UUID=([^[:space:]]+)$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+major_version() {
+    local version="$1"
+    echo "${version%%.*}"
+}
+
+get_os_version_id() {
+    local version_id=""
+    if [[ -r /etc/os-release ]]; then
+        version_id=$(awk -F= '$1=="VERSION_ID" {gsub(/"/,"",$2); print $2}' /etc/os-release)
+    fi
+    echo "$version_id"
+}
+
+validate_root_uuid_against_blkid() {
+    local cmdline="$1" source="$2" detected="$3" uuid
+
+    if ! uuid=$(extract_root_uuid "$cmdline"); then
+        return 0
+    fi
+
+    if [[ "$uuid" == "REPLACE-ME" ]]; then
+        die "Refusing to continue: cmdline from ${source} still contains root=UUID=REPLACE-ME."
+    fi
+
+    if ! blkid -t "UUID=$uuid" >/dev/null 2>&1; then
+        if [[ "$detected" == "1" ]]; then
+            die "Detected cmdline from ${source} references root UUID '${uuid}', but blkid cannot find it."
+        fi
+        die "Configured cmdline references root UUID '${uuid}', but blkid cannot find it."
+    fi
+}
+
+warn_if_cmdline_short() {
+    local cmdline="$1" source="$2" token_count
+    token_count=$(count_cmdline_tokens "$cmdline")
+    if (( token_count < CMDLINE_MIN_TOKENS )); then
+        warn "Cmdline from ${source} looks unusually short after sanitization (${token_count} token(s)): ${cmdline}"
+    fi
+}
+
+persist_cmdline_metadata() {
+    local cmdline="$1" source="$2" version_id="$3"
+    local metadata_dir="${INITRAMFS_STATE_DIR}/cmdline"
+
+    mkdir -p "$metadata_dir"
+    printf '%s\n' "$cmdline" > "${metadata_dir}/effective-cmdline"
+    printf '%s\n' "$source" > "${metadata_dir}/source"
+    printf '%s\n' "$version_id" > "${metadata_dir}/version-id"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "${metadata_dir}/updated-at"
+}
+
+validate_final_cmdline() {
+    local cmdline="$1" source="$2" detected="$3"
+
+    [[ "$cmdline" =~ (^|[[:space:]])root=UUID=REPLACE-ME($|[[:space:]]) ]] \
+        && die "Refusing to build UKI with placeholder cmdline token root=UUID=REPLACE-ME."
+
+    warn_if_cmdline_short "$cmdline" "$source"
+    validate_root_uuid_against_blkid "$cmdline" "$source" "$detected"
+}
+
 read_grub_cmdline() {
     local file line value
 
@@ -619,13 +822,49 @@ read_grub_cmdline() {
 }
 
 get_effective_cmdline() {
-    local proc_cmdline kernel_cmdline grub_cmdline
+    local proc_cmdline kernel_cmdline grub_cmdline cached_cmdline
+    local cmdline_source="configured CMDLINE" detected_cmdline=0
+    local metadata_dir="${INITRAMFS_STATE_DIR}/cmdline"
+    local current_version_id cached_version_id current_major cached_major
+
+    current_version_id=$(get_os_version_id)
+    current_major=$(major_version "$current_version_id")
 
     if [[ "$AUTO_DETECT_CMDLINE" -eq 1 ]]; then
+        if [[ -r "${metadata_dir}/version-id" ]]; then
+            cached_version_id=$(<"${metadata_dir}/version-id")
+            cached_major=$(major_version "$cached_version_id")
+            if [[ -n "$cached_major" && -n "$current_major" && "$cached_major" != "$current_major" ]]; then
+                warn "Fedora major VERSION_ID changed (${cached_version_id} -> ${current_version_id}); forcing fresh cmdline detection."
+                cached_cmdline=""
+            elif [[ -r "${metadata_dir}/effective-cmdline" ]]; then
+                cached_cmdline=$(<"${metadata_dir}/effective-cmdline")
+            fi
+        elif [[ -r "${metadata_dir}/effective-cmdline" ]]; then
+            cached_cmdline=$(<"${metadata_dir}/effective-cmdline")
+        fi
+
+        if [[ -n "${cached_cmdline:-}" ]]; then
+            cached_cmdline=$(printf '%s\n' "$cached_cmdline" | sanitize_cmdline | xargs || true)
+            if [[ -n "$cached_cmdline" ]]; then
+                info "Using cached cmdline metadata from ${metadata_dir}/effective-cmdline"
+                cmdline_source="cached metadata"
+                detected_cmdline=1
+                validate_final_cmdline "$cached_cmdline" "$cmdline_source" "$detected_cmdline"
+                persist_cmdline_metadata "$cached_cmdline" "$cmdline_source" "$current_version_id"
+                echo "$cached_cmdline"
+                return 0
+            fi
+        fi
+
         if [[ -r /proc/cmdline ]]; then
             proc_cmdline=$(sanitize_cmdline < /proc/cmdline | xargs || true)
             if [[ -n "$proc_cmdline" && "$proc_cmdline" =~ (root=|rd.luks.uuid=|rootfstype=) ]]; then
                 info "Using cmdline from /proc/cmdline: ${proc_cmdline}"
+                cmdline_source="/proc/cmdline"
+                detected_cmdline=1
+                validate_final_cmdline "$proc_cmdline" "$cmdline_source" "$detected_cmdline"
+                persist_cmdline_metadata "$proc_cmdline" "$cmdline_source" "$current_version_id"
                 echo "$proc_cmdline"
                 return 0
             fi
@@ -635,6 +874,10 @@ get_effective_cmdline() {
             kernel_cmdline=$(sanitize_cmdline < /etc/kernel/cmdline | xargs || true)
             if [[ -n "$kernel_cmdline" && "$kernel_cmdline" =~ (root=|rd.luks.uuid=|rootfstype=) ]]; then
                 info "Using cmdline from /etc/kernel/cmdline: ${kernel_cmdline}"
+                cmdline_source="/etc/kernel/cmdline"
+                detected_cmdline=1
+                validate_final_cmdline "$kernel_cmdline" "$cmdline_source" "$detected_cmdline"
+                persist_cmdline_metadata "$kernel_cmdline" "$cmdline_source" "$current_version_id"
                 echo "$kernel_cmdline"
                 return 0
             fi
@@ -645,6 +888,10 @@ get_effective_cmdline() {
             grub_cmdline=$(printf '%s\n' "$grub_cmdline" | sanitize_cmdline | xargs || true)
             if [[ -n "$grub_cmdline" && "$grub_cmdline" =~ (root=|rd.luks.uuid=|rootfstype=) ]]; then
                 info "Using cmdline from GRUB configuration: ${grub_cmdline}"
+                cmdline_source="GRUB configuration"
+                detected_cmdline=1
+                validate_final_cmdline "$grub_cmdline" "$cmdline_source" "$detected_cmdline"
+                persist_cmdline_metadata "$grub_cmdline" "$cmdline_source" "$current_version_id"
                 echo "$grub_cmdline"
                 return 0
             fi
@@ -653,6 +900,8 @@ get_effective_cmdline() {
         warn "Auto-detect enabled, but no bootable cmdline was detected. Falling back to configured CMDLINE: ${CMDLINE}"
     fi
 
+    validate_final_cmdline "$CMDLINE" "$cmdline_source" "$detected_cmdline"
+    persist_cmdline_metadata "$CMDLINE" "$cmdline_source" "$current_version_id"
     info "Using configured cmdline: ${CMDLINE}"
     echo "$CMDLINE"
 }
@@ -845,6 +1094,7 @@ BUILDBODY
         -e "s|__INITRAMFS_FORBIDDEN_LIST__|${INITRAMFS_FORBIDDEN_LIST}|g" \
         -e "s|__INITRAMFS_STATE_DIR__|${INITRAMFS_STATE_DIR}|g" \
         -e "s|__INITRAMFS_STRICT_DIFF__|${INITRAMFS_STRICT_DIFF}|g" \
+        -e "s|__CMDLINE_MIN_TOKENS__|${CMDLINE_MIN_TOKENS}|g" \
         "$BUILD_SCRIPT"
 
     chmod 0755 "$BUILD_SCRIPT"
@@ -953,15 +1203,6 @@ phase_disable_bls_plugins() {
 phase_initial_build() {
     hr
     info "Phase 6: Building UKI for current kernel: $(uname -r)"
-
-    if [[ "$AUTO_DETECT_CMDLINE" -eq 0 && "$CMDLINE" == "root=UUID=REPLACE-ME rw quiet rhgb" ]]; then
-        warn "────────────────────────────────────────────────────────────"
-        warn "AUTO_DETECT_CMDLINE is disabled and CMDLINE is still placeholder text."
-        warn "Set CMDLINE to a real root=... value, or enable AUTO_DETECT_CMDLINE=1."
-        warn "────────────────────────────────────────────────────────────"
-        read -r -p "Continue with placeholder CMDLINE anyway? [y/N] " ans
-        [[ "${ans,,}" == "y" ]] || { info "Aborted. Set CMDLINE and re-run."; exit 0; }
-    fi
 
     "$BUILD_SCRIPT" "$(uname -r)"
 }
