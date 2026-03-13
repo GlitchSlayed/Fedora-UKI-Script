@@ -37,10 +37,20 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Rust unit/integration tests
-        run: cargo test --all-targets --locked
+        run: |
+          if [[ -f Cargo.lock ]]; then
+            cargo test --all-targets --locked
+          else
+            cargo test --all-targets
+          fi
 
       - name: Rust compile check
-        run: cargo check --all-targets --locked
+        run: |
+          if [[ -f Cargo.lock ]]; then
+            cargo check --all-targets --locked
+          else
+            cargo check --all-targets
+          fi
 
       - name: Bash syntax checks
         run: bash -n uki-setup.sh tests/test_uki_setup.sh

@@ -34,5 +34,5 @@ on Fedora-based systems via dracut and ukify.
 %{_bindir}/rustyuki
 
 %changelog
-* Thu Mar 13 2026 RustyUKI CI <ci@example.com> - 0.2.0-1
+* Fri Mar 13 2026 RustyUKI CI <ci@example.com> - 0.2.0-1
 - Initial Fedora RPM spec for automated CI builds
