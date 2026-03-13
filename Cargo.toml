@@ -1,7 +1,9 @@
 [package]
-name = "fedora-uki"
-version = "0.1.0"
+name = "rustyuki"
+version = "0.2.0"
 edition = "2021"
+description = "RustyUKI: Rust CLI to generate/install Fedora UKIs via dracut + ukify"
+license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

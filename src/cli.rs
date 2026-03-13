@@ -1,9 +1,9 @@
 use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
-/// Fedora UKI command-line interface.
+/// RustyUKI command-line interface.
 #[derive(Debug, Parser)]
-#[command(name = "fedora-uki", version, about)]
+#[command(name = "rustyuki", version, about)]
 pub struct Cli {
     /// Increase logging verbosity (-v debug, -vv trace).
     #[arg(short = 'v', action = ArgAction::Count, global = true)]
