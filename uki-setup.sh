@@ -70,6 +70,11 @@ SELF="$(realpath "$0")"
 BUILD_SCRIPT="/usr/local/sbin/uki-build.sh"
 INSTALL_PLUGIN="/usr/lib/kernel/install.d/90-uki-ukify.install"
 BACKUP_ROOT="/var/backups/uki-setup"
+RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_BACKUP_DIR="${BACKUP_ROOT}/${RUN_TIMESTAMP}"
+RUN_MANIFEST_DIR="${BACKUP_ROOT}/manifests"
+RUN_MANIFEST_PATH="${RUN_MANIFEST_DIR}/${RUN_TIMESTAMP}.manifest"
+ROLLBACK_SCRIPT="/usr/local/sbin/uki-rollback.sh"
 PKG_MGR=""
 PKG_INSTALL_CMD=()
 DRY_RUN=0
@@ -82,6 +87,46 @@ warn()  { echo "${YLW}${BLD}[warn]${RST} $*" >&2; }
 die()   { echo "${RED}${BLD}[err]${RST}  $*" >&2; exit 1; }
 hr()    { echo "──────────────────────────────────────────────────────────────"; }
 require_cmd() { command -v "$1" &>/dev/null || die "Required command missing: $1"; }
+
+refresh_run_paths() {
+    RUN_BACKUP_DIR="${BACKUP_ROOT}/${RUN_TIMESTAMP}"
+    RUN_MANIFEST_DIR="${BACKUP_ROOT}/manifests"
+    RUN_MANIFEST_PATH="${RUN_MANIFEST_DIR}/${RUN_TIMESTAMP}.manifest"
+}
+
+init_run_manifest() {
+    refresh_run_paths
+    mkdir -p "$RUN_MANIFEST_DIR" "$RUN_BACKUP_DIR"
+    cat > "$RUN_MANIFEST_PATH" <<EOF
+# uki-setup manifest v1
+timestamp=${RUN_TIMESTAMP}
+script=uki-setup.sh
+backup_dir=${RUN_BACKUP_DIR}
+EOF
+}
+
+ensure_manifest_ready() {
+    refresh_run_paths
+    if [[ ! -f "$RUN_MANIFEST_PATH" ]]; then
+        init_run_manifest
+    fi
+}
+
+append_manifest_entry() {
+    local op="$1" path="$2" backup_ref="${3:-}" extra="${4:-}"
+    ensure_manifest_ready
+    printf '%s|%s|%s|%s\n' "$op" "$path" "$backup_ref" "$extra" >> "$RUN_MANIFEST_PATH"
+}
+
+record_created_path() {
+    local path="$1"
+    append_manifest_entry "created" "$path" ""
+}
+
+record_deleted_path() {
+    local path="$1" backup_ref="${2:-}"
+    append_manifest_entry "deleted" "$path" "$backup_ref"
+}
 
 list_installed_kernels() {
     local pkg kernel_ver
@@ -442,12 +487,13 @@ ensure_esp_mounted() {
 backup_path() {
     local src="$1"
     [[ -e "$src" || -L "$src" ]] || return 0
-    local ts backup_dir backup
-    ts="$(date +%Y%m%d-%H%M%S)"
-    backup_dir="${BACKUP_ROOT}/${ts}"
+    local backup_dir backup
+    refresh_run_paths
+    backup_dir="${RUN_BACKUP_DIR}"
     backup="${backup_dir}${src}"
     mkdir -p "$(dirname "$backup")"
     cp -a "$src" "$backup"
+    append_manifest_entry "modified" "$src" "$backup"
     info "Backed up ${src} -> ${backup}"
 }
 
@@ -607,6 +653,10 @@ BOOT_SUCCESS_DIR="/var/lib/uki-ukify/boot-success"
 BACKUP_ROOT="/var/backups/uki-setup"
 EFI_AUDIT_LOG="/var/log/uki-efi-audit.log"
 DRY_RUN=0
+RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_BACKUP_DIR="${BACKUP_ROOT}/${RUN_TIMESTAMP}"
+RUN_MANIFEST_DIR="${BACKUP_ROOT}/manifests"
+RUN_MANIFEST_PATH="${RUN_MANIFEST_DIR}/${RUN_TIMESTAMP}.manifest"
 # ─────────────────────────────────────────────────────────────────────────────
 
 RED='\e[31;1m'; GRN='\e[32;1m'; YLW='\e[33;1m'; RST='\e[0m'
@@ -614,6 +664,46 @@ info()  { echo -e "${GRN}[uki-build]${RST} $*"; }
 warn()  { echo -e "${YLW}[uki-build]${RST} $*" >&2; }
 die()   { echo -e "${RED}[uki-build]${RST} $*" >&2; exit 1; }
 require_cmd() { command -v "$1" &>/dev/null || die "Required command missing: $1"; }
+
+refresh_run_paths() {
+    RUN_BACKUP_DIR="${BACKUP_ROOT}/${RUN_TIMESTAMP}"
+    RUN_MANIFEST_DIR="${BACKUP_ROOT}/manifests"
+    RUN_MANIFEST_PATH="${RUN_MANIFEST_DIR}/${RUN_TIMESTAMP}.manifest"
+}
+
+init_run_manifest() {
+    refresh_run_paths
+    mkdir -p "$RUN_MANIFEST_DIR" "$RUN_BACKUP_DIR"
+    cat > "$RUN_MANIFEST_PATH" <<EOF
+# uki-setup manifest v1
+timestamp=${RUN_TIMESTAMP}
+script=uki-build.sh
+backup_dir=${RUN_BACKUP_DIR}
+EOF
+}
+
+ensure_manifest_ready() {
+    refresh_run_paths
+    if [[ ! -f "$RUN_MANIFEST_PATH" ]]; then
+        init_run_manifest
+    fi
+}
+
+append_manifest_entry() {
+    local op="$1" path="$2" backup_ref="${3:-}" extra="${4:-}"
+    ensure_manifest_ready
+    printf '%s|%s|%s|%s\n' "$op" "$path" "$backup_ref" "$extra" >> "$RUN_MANIFEST_PATH"
+}
+
+backup_path_for_manifest() {
+    refresh_run_paths
+    local src="$1"
+    [[ -e "$src" || -L "$src" ]] || return 1
+    local backup="${RUN_BACKUP_DIR}${src}"
+    mkdir -p "$(dirname "$backup")"
+    cp -a "$src" "$backup"
+    echo "$backup"
+}
 
 list_installed_kernels() {
     local pkg kernel_ver
@@ -662,6 +752,7 @@ backup_efibootmgr_snapshot() {
     fi
 
     efibootmgr -v > "$snapshot_file"
+    append_manifest_entry "efi_snapshot" "efibootmgr" "$snapshot_file" "$reason"
     info "Saved efibootmgr snapshot: ${snapshot_file}"
     audit_efi_event "Saved efibootmgr snapshot ${snapshot_file}"
 }
@@ -714,6 +805,10 @@ delete_uki_and_entry() {
 
     uki="${EFI_DIR}/linux-${kernel_ver}.efi"
     if [[ -f "$uki" ]]; then
+        local deleted_backup=""
+        if deleted_backup=$(backup_path_for_manifest "$uki"); then
+            append_manifest_entry "deleted" "$uki" "$deleted_backup"
+        fi
         log_or_run "Remove stale UKI ${uki}" rm -f "$uki"
         audit_efi_event "Removed stale UKI ${uki}"
     fi
@@ -1221,9 +1316,15 @@ ESP_MOUNT_CHECK=$(find_mounted_esp_target || true)
 [[ -n "$ESP_MOUNT_CHECK" ]] || die "ESP mount verification failed after mount attempts. Checked candidates: ${ESP_MOUNT_CANDIDATES[*]}. Fix: mount your ESP manually (typically /boot/efi) and re-run."
 validate_esp_free_space "$ESP_MOUNT_CHECK"
 
+init_run_manifest
 EFFECTIVE_CMDLINE=$(get_effective_cmdline)
 
 cleanup_items=("$INITRD_OUT")
+if [[ -e "$UKI_OUT" || -L "$UKI_OUT" ]]; then
+    if prev_backup=$(backup_path_for_manifest "$UKI_OUT"); then
+        append_manifest_entry "modified" "$UKI_OUT" "$prev_backup"
+    fi
+fi
 
 info "Stage 1/2: Building standalone initramfs via dracut: ${INITRD_OUT}"
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -1275,6 +1376,9 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     info "[dry-run] Would run: ukify ${UKIFY_ARGS[*]}"
 else
     ukify "${UKIFY_ARGS[@]}"
+    if [[ -f "$UKI_OUT" ]]; then
+        append_manifest_entry "created" "$UKI_OUT" "" "kernel=${KERNEL_VER}"
+    fi
 fi
 
 extract_uki_section_text() {
@@ -1420,7 +1524,173 @@ BUILDBODY
         "$BUILD_SCRIPT"
 
     chmod 0755 "$BUILD_SCRIPT"
+    record_created_path "$BUILD_SCRIPT"
     info "Build script written."
+}
+
+
+phase_write_rollback_script() {
+    hr
+    info "Phase 4: Writing rollback script → ${ROLLBACK_SCRIPT}"
+
+    mkdir -p "$(dirname "$ROLLBACK_SCRIPT")"
+    backup_path "$ROLLBACK_SCRIPT"
+
+    cat > "$ROLLBACK_SCRIPT" <<'ROLLBACKBODY'
+#!/bin/bash
+set -euo pipefail
+
+BACKUP_ROOT="/var/backups/uki-setup"
+MANIFEST_DIR="${BACKUP_ROOT}/manifests"
+DRY_RUN=0
+TARGET_TS=""
+
+RED='\e[31;1m'; GRN='\e[32;1m'; YLW='\e[33;1m'; RST='\e[0m'
+info()  { echo -e "${GRN}[uki-rollback]${RST} $*"; }
+warn()  { echo -e "${YLW}[uki-rollback]${RST} $*" >&2; }
+die()   { echo -e "${RED}[uki-rollback]${RST} $*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage: uki-rollback.sh [--list] [--timestamp <UTC_TIMESTAMP>] [--dry-run]
+
+Options:
+  --list                    List available backup timestamps.
+  --timestamp <timestamp>   Explicit backup timestamp to restore (required unless --list).
+  --dry-run                 Preview actions without modifying system state.
+  -h, --help                Show this help output.
+EOF
+}
+
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Required command missing: $1"; }
+
+run_or_echo() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "[dry-run] $*"
+    else
+        "$@"
+    fi
+}
+
+list_timestamps() {
+    [[ -d "$MANIFEST_DIR" ]] || { warn "No manifest directory found: ${MANIFEST_DIR}"; return 0; }
+    find "$MANIFEST_DIR" -maxdepth 1 -type f -name '*.manifest' -printf '%f\n' \
+        | sed 's/\.manifest$//' | sort
+}
+
+validate_manifest() {
+    local manifest="$1"
+    [[ -s "$manifest" ]] || die "Manifest is missing or empty: $manifest"
+    head -1 "$manifest" | grep -q '^# uki-setup manifest v1$' || die "Malformed manifest header in: $manifest"
+}
+
+restore_efi_from_snapshot() {
+    local snapshot="$1" line bootnum disk part label loader
+    [[ -f "$snapshot" ]] || { warn "EFI snapshot not found: $snapshot"; return 0; }
+    require_cmd efibootmgr
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^Boot([0-9A-Fa-f]{4})\*?[[:space:]]+([^[:space:]].*?)[[:space:]]+HD\(([0-9]+),GPT, ]] || continue
+        bootnum="${BASH_REMATCH[1]}"
+        label="${BASH_REMATCH[2]}"
+        part="${BASH_REMATCH[3]}"
+        loader=$(echo "$line" | sed -n 's/.*File(\\\(.*\))/\1/p')
+        [[ -n "$loader" ]] || continue
+
+        if efibootmgr | grep -q "^Boot${bootnum}"; then
+            info "EFI entry Boot${bootnum} already exists; skipping recreate."
+            continue
+        fi
+
+        disk=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || true)
+        [[ -b "$disk" ]] || { warn "Cannot determine ESP disk for EFI restore; skipping Boot${bootnum}."; continue; }
+        disk="/dev/$(lsblk -no PKNAME "$disk" 2>/dev/null | head -1)"
+        [[ -b "$disk" ]] || { warn "Cannot resolve parent disk for EFI restore; skipping Boot${bootnum}."; continue; }
+
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            info "[dry-run] efibootmgr --create --disk ${disk} --part ${part} --label ${label} --loader \\${loader}"
+        else
+            efibootmgr --quiet --create --disk "$disk" --part "$part" --label "$label" --loader "\\${loader}" || warn "Failed to recreate EFI entry Boot${bootnum}"
+        fi
+    done < "$snapshot"
+}
+
+restore_from_manifest() {
+    local manifest="$1" line op path backup extra
+    validate_manifest "$manifest"
+
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^# || "$line" =~ ^timestamp= || "$line" =~ ^script= || "$line" =~ ^backup_dir= ]] && continue
+        IFS='|' read -r op path backup extra <<< "$line"
+
+        case "$op" in
+            modified)
+                [[ -n "$backup" && -e "$backup" ]] || { warn "Missing backup for modified path: $path"; continue; }
+                run_or_echo mkdir -p "$(dirname "$path")"
+                run_or_echo cp -a "$backup" "$path"
+                ;;
+            created)
+                if [[ -e "$path" || -L "$path" ]]; then
+                    run_or_echo rm -rf "$path"
+                fi
+                ;;
+            deleted)
+                if [[ -n "$backup" && ( -e "$backup" || -L "$backup" ) ]]; then
+                    run_or_echo mkdir -p "$(dirname "$path")"
+                    run_or_echo cp -a "$backup" "$path"
+                else
+                    warn "Cannot recreate deleted path without backup: $path"
+                fi
+                ;;
+            efi_snapshot)
+                restore_efi_from_snapshot "$backup"
+                ;;
+            *)
+                warn "Skipping malformed/unknown manifest entry: $line"
+                ;;
+        esac
+    done < "$manifest"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --list)
+            list_timestamps
+            exit 0
+            ;;
+        --timestamp)
+            shift
+            [[ $# -gt 0 ]] || die "--timestamp requires a value"
+            TARGET_TS="$1"
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "Unknown option: $1"
+            ;;
+    esac
+    shift
+done
+
+[[ $EUID -eq 0 ]] || die "Must run as root."
+[[ -n "$TARGET_TS" ]] || die "Missing required --timestamp. Use --list to view available timestamps."
+MANIFEST_PATH="${MANIFEST_DIR}/${TARGET_TS}.manifest"
+[[ -f "$MANIFEST_PATH" ]] || die "Backup manifest not found: ${MANIFEST_PATH}"
+
+info "Restoring backup timestamp: ${TARGET_TS}"
+[[ "$DRY_RUN" -eq 1 ]] && info "Dry-run mode enabled."
+restore_from_manifest "$MANIFEST_PATH"
+info "Rollback complete."
+ROLLBACKBODY
+
+    chmod 0755 "$ROLLBACK_SCRIPT"
+    record_created_path "$ROLLBACK_SCRIPT"
+    info "Rollback script written."
 }
 
 # =============================================================================
@@ -1476,6 +1746,7 @@ exit 0
 PLUGINBODY
 
     chmod 0755 "$INSTALL_PLUGIN"
+    record_created_path "$INSTALL_PLUGIN"
     info "Plugin written."
 }
 
@@ -1507,6 +1778,7 @@ phase_disable_bls_plugins() {
         backup_path "$target"
         if [[ ! -e "$target" ]]; then
             ln -s /dev/null "$target"
+            record_created_path "$target"
             info "  Disabled: ${p}"
         else
             info "  Already overridden: ${p} — skipping."
@@ -1556,6 +1828,7 @@ phase_summary() {
     echo "  Files installed:"
     echo "    ${BUILD_SCRIPT}   ← rebuild script (edit CMDLINE here)"
     echo "    ${INSTALL_PLUGIN} ← auto-trigger on kernel installs"
+    echo "    ${ROLLBACK_SCRIPT} ← rollback helper"
     echo ""
     echo "  UKIs are stored in: ${EFI_DIR}/"
     find "${EFI_DIR}" -maxdepth 1 -type f -name "*.efi" -exec ls -lh {} + 2>/dev/null | sed 's/^/    /' || true
@@ -1618,9 +1891,11 @@ EOF
 if [[ "${UKI_SETUP_SKIP_MAIN:-0}" -ne 1 ]]; then
     parse_cli_args "$@"
     [[ "$DRY_RUN" -eq 1 ]] && info "Dry-run mode enabled. Build script invocations will use --dry-run."
+    init_run_manifest
     phase_preflight
     phase_deps
     phase_write_build_script
+    phase_write_rollback_script
     phase_write_plugin
     phase_disable_bls_plugins
     phase_initial_build
