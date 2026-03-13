@@ -82,6 +82,22 @@ die()   { echo "${RED}${BLD}[err]${RST}  $*" >&2; exit 1; }
 hr()    { echo "──────────────────────────────────────────────────────────────"; }
 require_cmd() { command -v "$1" &>/dev/null || die "Required command missing: $1"; }
 
+list_installed_kernels() {
+    local pkg kernel_ver
+
+    if ! rpm -q kernel &>/dev/null; then
+        return 0
+    fi
+
+    while IFS= read -r pkg; do
+        [[ -n "$pkg" ]] || continue
+        kernel_ver="${pkg#kernel-}"
+        [[ -n "$kernel_ver" && "$kernel_ver" != "$pkg" ]] || continue
+        [[ -f "/lib/modules/${kernel_ver}/vmlinuz" ]] || continue
+        echo "$kernel_ver"
+    done < <(rpm -q kernel 2>/dev/null)
+}
+
 sanitize_cmdline() {
     sed -E 's/(^| )BOOT_IMAGE=[^ ]*//g; s/(^| )initrd=[^ ]*//g; s/(^| )rd\.driver\.blacklist=[^ ]*//g; s/  +/ /g; s/^ //; s/ $//'
 }
@@ -586,6 +602,7 @@ INITRAMFS_FORBIDDEN_LIST="__INITRAMFS_FORBIDDEN_LIST__"
 INITRAMFS_STATE_DIR="__INITRAMFS_STATE_DIR__"
 INITRAMFS_STRICT_DIFF=__INITRAMFS_STRICT_DIFF__
 CMDLINE_MIN_TOKENS=__CMDLINE_MIN_TOKENS__
+BOOT_SUCCESS_DIR="/var/lib/uki-ukify/boot-success"
 # ─────────────────────────────────────────────────────────────────────────────
 
 RED='\e[31;1m'; GRN='\e[32;1m'; YLW='\e[33;1m'; RST='\e[0m'
@@ -593,6 +610,94 @@ info()  { echo -e "${GRN}[uki-build]${RST} $*"; }
 warn()  { echo -e "${YLW}[uki-build]${RST} $*" >&2; }
 die()   { echo -e "${RED}[uki-build]${RST} $*" >&2; exit 1; }
 require_cmd() { command -v "$1" &>/dev/null || die "Required command missing: $1"; }
+
+list_installed_kernels() {
+    local pkg kernel_ver
+
+    if ! rpm -q kernel &>/dev/null; then
+        return 0
+    fi
+
+    while IFS= read -r pkg; do
+        [[ -n "$pkg" ]] || continue
+        kernel_ver="${pkg#kernel-}"
+        [[ -n "$kernel_ver" && "$kernel_ver" != "$pkg" ]] || continue
+        [[ -f "/lib/modules/${kernel_ver}/vmlinuz" ]] || continue
+        echo "$kernel_ver"
+    done < <(rpm -q kernel 2>/dev/null)
+}
+
+delete_uki_and_entry() {
+    local kernel_ver="$1" uki label boot_num
+
+    uki="${EFI_DIR}/linux-${kernel_ver}.efi"
+    if [[ -f "$uki" ]]; then
+        rm -f "$uki"
+        info "Removed stale UKI: ${uki}"
+    fi
+
+    label="Linux UKI ${kernel_ver}"
+    boot_num=$(efibootmgr 2>/dev/null \
+        | grep -F "* ${label}" \
+        | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p' \
+        || true)
+    if [[ -n "$boot_num" ]]; then
+        efibootmgr --quiet --bootnum "$boot_num" --delete-bootnum
+        info "Removed stale EFI entry Boot${boot_num} (${label})"
+    fi
+}
+
+reconcile_kernel_ukis() {
+    local kernel_ver current_running confirmed_kernel marker
+    local -a installed_kernels=()
+    local -a built_kernels=()
+    local -a stale_kernels=()
+    local -A installed_map=()
+
+    while IFS= read -r kernel_ver; do
+        [[ -n "$kernel_ver" ]] || continue
+        installed_kernels+=("$kernel_ver")
+        installed_map["$kernel_ver"]=1
+    done < <(list_installed_kernels | sort -u)
+
+    if [[ ${#installed_kernels[@]} -eq 0 ]]; then
+        warn "No installed kernels found via 'rpm -q kernel'; skipping reconcile."
+        return 0
+    fi
+
+    for kernel_ver in "${installed_kernels[@]}"; do
+        "$0" "$kernel_ver"
+        built_kernels+=("$kernel_ver")
+    done
+
+    while IFS= read -r kernel_ver; do
+        [[ -n "$kernel_ver" ]] || continue
+        if [[ -z "${installed_map[$kernel_ver]+x}" ]]; then
+            stale_kernels+=("$kernel_ver")
+        fi
+    done < <(find "$EFI_DIR" -maxdepth 1 -type f -name 'linux-*.efi' -printf '%f\n' \
+        | sed -n 's/^linux-\(.*\)\.efi$/\1/p' | sort -u)
+
+    current_running="$(uname -r)"
+    marker="${BOOT_SUCCESS_DIR}/${current_running}.ok"
+
+    if [[ -f "$marker" ]]; then
+        confirmed_kernel="$current_running"
+    fi
+
+    if [[ ${#stale_kernels[@]} -gt 0 ]]; then
+        if [[ -z "$confirmed_kernel" ]]; then
+            warn "Deferring stale UKI pruning until boot is confirmed for current kernel (${current_running})."
+            warn "Create marker after successful boot: mkdir -p ${BOOT_SUCCESS_DIR} && touch ${marker}"
+        else
+            for kernel_ver in "${stale_kernels[@]}"; do
+                delete_uki_and_entry "$kernel_ver"
+            done
+        fi
+    fi
+
+    info "Reconcile complete. Installed kernels: ${#installed_kernels[@]}, UKIs rebuilt: ${#built_kernels[@]}, stale UKIs detected: ${#stale_kernels[@]}."
+}
 
 ESP_MOUNT_CANDIDATES=(
     /boot/efi
@@ -976,6 +1081,15 @@ validate_initramfs_artifact() {
     fi
 }
 
+if [[ "${1:-}" == "--reconcile" ]]; then
+    [[ $EUID -eq 0 ]] || die "Must run as root."
+    require_cmd rpm
+    require_cmd efibootmgr
+    mkdir -p "$EFI_DIR" "$BOOT_SUCCESS_DIR"
+    reconcile_kernel_ukis
+    exit 0
+fi
+
 KERNEL_VER="${1:-$(uname -r)}"
 KERNEL_IMG="/lib/modules/${KERNEL_VER}/vmlinuz"
 INITRD_OUT="/tmp/initramfs-${KERNEL_VER}.img"
@@ -990,6 +1104,7 @@ require_cmd lsblk
 require_cmd blkid
 require_cmd df
 require_cmd efibootmgr
+require_cmd rpm
 [[ -f "$KERNEL_IMG" ]] || die "Kernel image not found: ${KERNEL_IMG}"
 mkdir -p "$EFI_DIR"
 ensure_esp_mounted || die "ESP is not mounted and automatic mount failed. Checked: ${ESP_MOUNT_CANDIDATES[*]}"
@@ -1127,30 +1242,26 @@ warn() { logger -p user.warning -t uki-install "\$*"; echo "[uki-install] WARN: 
 
 case "\$COMMAND" in
     add)
-        log "Kernel add: \${KERNEL_VER} — rebuilding UKI…"
+        log "Kernel add: \${KERNEL_VER} — reconciling all installed kernel UKIs…"
         if [[ ! -x "\$BUILD_SCRIPT" ]]; then
             warn "\${BUILD_SCRIPT} not found/executable — skipping."
             exit 0
         fi
-        "\$BUILD_SCRIPT" "\$KERNEL_VER"
+        "\$BUILD_SCRIPT" --reconcile
         ;;
     remove)
-        log "Kernel remove: \${KERNEL_VER} — cleaning UKI…"
-        UKI="${EFI_DIR}/linux-\${KERNEL_VER}.efi"
-        if [[ -f "\$UKI" ]]; then
-            rm -f "\$UKI"
-            log "Removed \${UKI}"
+        log "Kernel remove: \${KERNEL_VER} — reconciling against installed RPM kernels…"
+        if [[ ! -x "\$BUILD_SCRIPT" ]]; then
+            warn "\${BUILD_SCRIPT} not found/executable — skipping."
+            exit 0
         fi
-        LABEL="Linux UKI \${KERNEL_VER}"
-        BOOT_NUM=\$(efibootmgr 2>/dev/null \
-            | grep -F "* \${LABEL}" \
-            | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p' || true)
-        if [[ -n "\$BOOT_NUM" ]]; then
-            efibootmgr --quiet --bootnum "\$BOOT_NUM" --delete-bootnum \
-                && log "Removed EFI entry Boot\${BOOT_NUM}"
-        fi
+        "\$BUILD_SCRIPT" --reconcile
         ;;
     *)
+        if [[ -x "\$BUILD_SCRIPT" ]]; then
+            log "Kernel command '\$COMMAND': running maintenance reconcile."
+            "\$BUILD_SCRIPT" --reconcile
+        fi
         exit 0
         ;;
 esac
@@ -1202,9 +1313,25 @@ phase_disable_bls_plugins() {
 
 phase_initial_build() {
     hr
-    info "Phase 6: Building UKI for current kernel: $(uname -r)"
+    local -a kernels=()
+    local kernel_ver
 
-    "$BUILD_SCRIPT" "$(uname -r)"
+    info "Phase 6: Building UKIs for installed kernels"
+    while IFS= read -r kernel_ver; do
+        [[ -n "$kernel_ver" ]] || continue
+        kernels+=("$kernel_ver")
+    done < <(list_installed_kernels | sort -u)
+
+    if [[ ${#kernels[@]} -eq 0 ]]; then
+        die "No installable kernels found via 'rpm -q kernel'."
+    fi
+
+    for kernel_ver in "${kernels[@]}"; do
+        info "Building UKI for kernel: ${kernel_ver}"
+        "$BUILD_SCRIPT" "$kernel_ver"
+    done
+
+    info "Initial UKI build complete for ${#kernels[@]} installed kernel(s)."
 }
 
 # =============================================================================
@@ -1231,6 +1358,17 @@ phase_summary() {
     echo ""
     echo "  To rebuild manually:"
     echo "    sudo ${BUILD_SCRIPT} \$(uname -r)"
+    echo ""
+    echo "  To reconcile all installed kernels now:"
+    echo "    sudo ${BUILD_SCRIPT} --reconcile"
+    echo ""
+    echo "  Retention/pruning behavior:"
+    echo "    * UKIs are reconciled against installed kernels from 'rpm -q kernel'."
+    echo "    * UKIs for removed kernels are retained until boot success is confirmed"
+    echo "      for the current kernel via marker:"
+    echo "      /var/lib/uki-ukify/boot-success/\$(uname -r).ok"
+    echo "    * Example confirmation command after successful boot:"
+    echo "      sudo mkdir -p /var/lib/uki-ukify/boot-success && sudo touch /var/lib/uki-ukify/boot-success/\$(uname -r).ok"
     echo ""
     echo "  Backups created under: ${BACKUP_ROOT}/"
     echo ""

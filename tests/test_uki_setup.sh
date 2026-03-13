@@ -50,6 +50,10 @@ grep -q "INITRAMFS_STATE_DIR=\"$INITRAMFS_STATE_DIR\"" "$BUILD_SCRIPT"
 grep -q 'INITRAMFS_STRICT_DIFF=1' "$BUILD_SCRIPT"
 grep -q 'lsinitrd --unpack' "$BUILD_SCRIPT"
 grep -q 'diff -u "$previous_manifest" "$current_manifest"' "$BUILD_SCRIPT"
+grep -q 'BOOT_SUCCESS_DIR="/var/lib/uki-ukify/boot-success"' "$BUILD_SCRIPT"
+grep -q 'list_installed_kernels()' "$BUILD_SCRIPT"
+grep -q 'reconcile_kernel_ukis()' "$BUILD_SCRIPT"
+grep -q 'if \[\[ "\${1:-}" == "--reconcile" \]\]' "$BUILD_SCRIPT"
 
 phase_write_plugin
 
@@ -59,6 +63,7 @@ phase_write_plugin
 }
 
 grep -q "BUILD_SCRIPT=\"$BUILD_SCRIPT\"" "$INSTALL_PLUGIN"
-grep -Fq "UKI=\"${EFI_DIR}/linux-\${KERNEL_VER}.efi\"" "$INSTALL_PLUGIN"
+grep -q '"\$BUILD_SCRIPT" --reconcile' "$INSTALL_PLUGIN"
+grep -q 'Kernel add: \${KERNEL_VER} — reconciling all installed kernel UKIs' "$INSTALL_PLUGIN"
 
 echo "All local UKI setup checks passed."
