@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   fedora-checks:
     runs-on: ubuntu-latest
@@ -11,7 +14,7 @@ jobs:
       # Keep this pinned to a stable Fedora release so CI remains reproducible.
       image: fedora:41
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install check dependencies
         run: |
@@ -24,6 +27,7 @@ jobs:
             findutils \
             grep \
             rust \
+            rustfmt \
             sed \
             util-linux \
             which \
