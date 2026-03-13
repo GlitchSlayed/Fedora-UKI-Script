@@ -29,7 +29,7 @@ use cmd::{CommandRunner, ProcessOutput};
 use config::AppConfig;
 use dracut::build_initramfs;
 use efi::{make_efi_loader_path, validate_esp_mount};
-use kernel::{prune_stale_uki_artifacts, resolve_cmdline, sanitize_cmdline};
+use kernel::{prune_stale_uki_artifacts, resolve_cmdline, sanitize_cmdline, CmdlineSettings};
 use ukify::{build_uki, UkifyParams};
 
 struct ExpectedCall {
@@ -333,9 +333,25 @@ fn cmdline_sanitization_and_resolution_match_legacy_expectations() {
     let cmdline_file = temp.path().join("cmdline");
     std::fs::write(&cmdline_file, "root=UUID=file rw").unwrap_or_else(|e| panic!("{e}"));
 
-    let resolved = resolve_cmdline(&cmdline_file, "root=UUID=fallback rw", false)
-        .unwrap_or_else(|e| panic!("{e}"));
+    let runner = MockRunner::new(vec![ExpectedCall {
+        program: "blkid".to_string(),
+        args: vec!["-t".to_string(), "UUID=fallback".to_string()],
+        output: Ok(ProcessOutput::default()),
+    }]);
+
+    let resolved = resolve_cmdline(
+        &runner,
+        &CmdlineSettings {
+            configured_cmdline: "root=UUID=fallback rw".to_string(),
+            auto_detect: false,
+            cmdline_file: cmdline_file.clone(),
+            state_dir: temp.path().join("state"),
+            cmdline_min_tokens: 3,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(resolved, "root=UUID=fallback rw");
+    runner.assert_no_pending();
 }
 
 #[test]

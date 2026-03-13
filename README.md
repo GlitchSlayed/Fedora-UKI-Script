@@ -136,6 +136,12 @@ configured_cmdline = "root=UUID=REPLACE-ME rw quiet rhgb"
 # Enable cmdline auto-detection from /proc/cmdline, then cmdline_file
 auto_detect_cmdline = true
 
+# Metadata directory for detected cmdline state
+cmdline_state_dir = "/var/lib/uki-build"
+
+# Warn if cmdline has fewer tokens than this
+cmdline_min_tokens = 3
+
 # Optional: path to a splash/logo image to embed
 splash = ""
 

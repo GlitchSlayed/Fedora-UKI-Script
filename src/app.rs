@@ -3,7 +3,9 @@ use crate::cmd::CommandRunner;
 use crate::config::AppConfig;
 use crate::dracut::build_initramfs;
 use crate::efi::{register_boot_entry, validate_esp_mount};
-use crate::kernel::{list_installed_kernels, prune_stale_uki_artifacts, resolve_cmdline};
+use crate::kernel::{
+    list_installed_kernels, prune_stale_uki_artifacts, resolve_cmdline, CmdlineSettings,
+};
 use crate::ukify::{build_uki, UkifyParams};
 use anyhow::{Context, Result};
 use log::info;
@@ -95,9 +97,14 @@ pub fn generate(
     )?;
 
     let normalized_cmdline = resolve_cmdline(
-        &settings.cmdline_file,
-        &cfg.uki.configured_cmdline,
-        cfg.uki.auto_detect_cmdline,
+        runner,
+        &CmdlineSettings {
+            configured_cmdline: cfg.uki.configured_cmdline.clone(),
+            auto_detect: cfg.uki.auto_detect_cmdline,
+            cmdline_file: settings.cmdline_file.clone(),
+            state_dir: cfg.uki.cmdline_state_dir.clone(),
+            cmdline_min_tokens: cfg.uki.cmdline_min_tokens,
+        },
     )?;
 
     let uki_path = settings
