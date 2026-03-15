@@ -8,25 +8,20 @@ URL:            https://github.com/GlitchSlayed/RustyUKI
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo
-BuildRequires:  cargo-rpm-macros
-BuildRequires:  rust-packaging
+BuildRequires:  rust
 
 %description
 RustyUKI is a Rust-native CLI for building and installing Unified Kernel Images
 on Fedora-based systems via dracut and ukify.
 
-%generate_buildrequires
-%cargo_generate_buildrequires
-
 %prep
 %autosetup -n %{name}-%{version}
-%cargo_prep
 
 %build
-%cargo_build
+cargo build --release --locked
 
 %install
-%cargo_install
+install -Dpm0755 target/release/rustyuki %{buildroot}%{_bindir}/rustyuki
 
 %files
 %license LICENSE
