@@ -60,7 +60,7 @@ jobs:
           find "${topdir}/SRPMS" -type f -name '*.src.rpm' -exec cp {} dist/ \;
 
       - name: Upload RPM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: fedora-rpm-ci-${{ github.run_number }}
           path: dist/*
