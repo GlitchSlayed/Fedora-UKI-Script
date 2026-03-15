@@ -62,7 +62,7 @@ jobs:
             echo "failed to locate generated buildreqs rpm" >&2
             exit 1
           fi
-          dnf -y builddep "${buildreq_rpm}"
+          dnf -y install "${buildreq_rpm}"
 
           rpmbuild -ba "${topdir}/SPECS/rustyuki.spec"
 
