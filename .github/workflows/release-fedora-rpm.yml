@@ -33,8 +33,6 @@ jobs:
             rpmdevtools \
             cargo \
             rust \
-            cargo-rpm-macros \
-            rust-packaging \
             gh \
             jq
 

@@ -30,8 +30,6 @@ jobs:
             rpmdevtools \
             cargo \
             rust \
-            cargo-rpm-macros \
-            rust-packaging
 
       - name: Checkout repository
         uses: actions/checkout@v5
