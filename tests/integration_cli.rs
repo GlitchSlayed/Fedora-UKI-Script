@@ -5,6 +5,16 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+fn test_esp_mountpoint() -> PathBuf {
+    for candidate in ["/dev/shm", "/tmp", "/"] {
+        let path = PathBuf::from(candidate);
+        if path.is_dir() {
+            return path;
+        }
+    }
+    panic!("no writable mount point available for ESP integration tests");
+}
+
 #[path = "../src/app.rs"]
 mod app;
 #[path = "../src/cli.rs"]
@@ -382,7 +392,7 @@ fn prune_removes_only_unknown_kernel_efis() {
 #[test]
 fn generate_with_boot_once_sets_bootnext_immediately() {
     let temp = TempDir::new().unwrap_or_else(|e| panic!("{e}"));
-    let esp = temp.path().join("esp");
+    let esp = test_esp_mountpoint();
     let out = esp.join("EFI/Linux");
     let cmdline = temp.path().join("cmdline");
     let os_release = temp.path().join("os-release");
@@ -538,6 +548,7 @@ Boot0008* Linux UKI 6.11.5-test	HD(...)
     assert_eq!(boot_num, "0008");
     runner.assert_no_pending();
 
+    std::fs::remove_file(&final_out).ok();
     std::fs::remove_file(kernel_dir.join("vmlinuz")).ok();
     std::fs::remove_dir(kernel_dir).ok();
 }
@@ -545,7 +556,7 @@ Boot0008* Linux UKI 6.11.5-test	HD(...)
 #[test]
 fn install_with_boot_once_sets_bootnext_after_bootctl_update() {
     let temp = TempDir::new().unwrap_or_else(|e| panic!("{e}"));
-    let esp = temp.path().join("esp");
+    let esp = test_esp_mountpoint();
     let out = esp.join("EFI/Linux");
     let cmdline = temp.path().join("cmdline");
     let os_release = temp.path().join("os-release");
@@ -714,6 +725,7 @@ Boot0007* Linux UKI 6.11.4-test	HD(...)
     assert_eq!(installed, final_out);
     runner.assert_no_pending();
 
+    std::fs::remove_file(&final_out).ok();
     std::fs::remove_file(kernel_dir.join("vmlinuz")).ok();
     std::fs::remove_dir(kernel_dir).ok();
 }

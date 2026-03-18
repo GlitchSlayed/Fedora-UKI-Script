@@ -1,7 +1,10 @@
 use crate::cmd::CommandRunner;
 use anyhow::{bail, Context, Result};
-use log::info;
+use log::{info, warn};
 use std::collections::HashSet;
+use std::ffi::CString;
+use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,14 +21,75 @@ pub struct BootState {
     pub entries: Vec<BootEntry>,
 }
 
-/// Validates that ESP mountpoint exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountInfo {
+    target: PathBuf,
+    options: Vec<String>,
+}
+
+/// Validates that ESP mountpoint exists as a directory.
 pub fn validate_esp_mount(esp_path: &Path) -> Result<()> {
-    if !esp_path.exists() {
-        bail!("ESP mount path does not exist: {}", esp_path.display());
+    if !esp_path.exists() || !esp_path.is_dir() {
+        bail!(
+            "ESP path {} does not exist. Is your ESP mounted?",
+            esp_path.display()
+        );
     }
-    if !esp_path.is_dir() {
-        bail!("ESP path is not a directory: {}", esp_path.display());
+
+    Ok(())
+}
+
+/// Validates that the ESP and output directory are ready for UKI generation.
+pub fn validate_esp_preflight(esp_path: &Path, output_dir: &Path) -> Result<()> {
+    validate_esp_mount(esp_path)?;
+
+    let mounts = parse_proc_mounts(
+        &fs::read_to_string("/proc/mounts")
+            .context("failed reading /proc/mounts while validating ESP mount state")?,
+    )?;
+
+    let mount = mounts
+        .iter()
+        .find(|mount| mount.target == esp_path)
+        .with_context(|| {
+            format!(
+                "ESP path {} is not a mount point. Run: mount {}",
+                esp_path.display(),
+                esp_path.display()
+            )
+        })?;
+
+    if mount.options.iter().any(|option| option == "ro") {
+        bail!(
+            "ESP is mounted read-only. Run: mount -o remount,rw {}",
+            esp_path.display()
+        );
     }
+
+    let free_bytes = statvfs_free_bytes(esp_path)?;
+    let free_mb = free_bytes / (1024 * 1024);
+    if free_mb < 50 {
+        bail!("ESP has only {free_mb}mb free. At least 50mb is required to write a UKI safely.");
+    }
+    if free_mb < 150 {
+        warn!("ESP has only {free_mb}mb free. Consider freeing space before generating a new UKI.");
+    }
+
+    fs::create_dir_all(output_dir).with_context(|| {
+        format!(
+            "failed creating UKI output directory {}",
+            output_dir.display()
+        )
+    })?;
+
+    ensure_path_writable(output_dir).with_context(|| {
+        format!(
+            "Output directory {} is not writable. Run `ls -la {}` to diagnose permissions.",
+            output_dir.display(),
+            output_dir.display()
+        )
+    })?;
+
     Ok(())
 }
 
@@ -232,6 +296,65 @@ fn parse_boot_state(text: &str) -> Result<BootState> {
     Ok(state)
 }
 
+fn parse_proc_mounts(text: &str) -> Result<Vec<MountInfo>> {
+    text.lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let _source = fields
+                .next()
+                .context("malformed /proc/mounts entry: missing source")?;
+            let target = fields
+                .next()
+                .context("malformed /proc/mounts entry: missing target")?;
+            let _fstype = fields
+                .next()
+                .context("malformed /proc/mounts entry: missing fs type")?;
+            let options = fields
+                .next()
+                .context("malformed /proc/mounts entry: missing mount options")?;
+
+            Ok(MountInfo {
+                target: PathBuf::from(unescape_mount_field(target)),
+                options: options.split(',').map(ToOwned::to_owned).collect(),
+            })
+        })
+        .collect()
+}
+
+fn unescape_mount_field(field: &str) -> String {
+    field
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+fn statvfs_free_bytes(path: &Path) -> Result<u64> {
+    let path_cstr = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("path contains interior null byte: {}", path.display()))?;
+    let mut stats = std::mem::MaybeUninit::<nix::libc::statvfs>::uninit();
+
+    let rc = unsafe { nix::libc::statvfs(path_cstr.as_ptr(), stats.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed reading free space for ESP path {}", path.display()));
+    }
+
+    let stats = unsafe { stats.assume_init() };
+    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
+fn ensure_path_writable(path: &Path) -> Result<()> {
+    let path_cstr = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("path contains interior null byte: {}", path.display()))?;
+    let rc = unsafe { nix::libc::access(path_cstr.as_ptr(), nix::libc::W_OK) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("write access check failed")
+    }
+}
+
 /// Converts absolute UKI path under ESP into EFI loader path using backslashes.
 pub fn make_efi_loader_path(esp_path: &Path, uki_path: &Path) -> Result<String> {
     let rel = uki_path.strip_prefix(esp_path).with_context(|| {
@@ -248,7 +371,8 @@ pub fn make_efi_loader_path(esp_path: &Path, uki_path: &Path) -> Result<String> 
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_new_entry_number, make_efi_loader_path, parse_boot_state, BootEntry, BootState,
+        detect_new_entry_number, make_efi_loader_path, parse_boot_state, parse_proc_mounts,
+        unescape_mount_field, BootEntry, BootState,
     };
     use std::path::Path;
 
@@ -307,5 +431,20 @@ mod tests {
         let boot_num = detect_new_entry_number(Some(&before), &after, "Linux UKI 6.11.4")
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(boot_num, "0007");
+    }
+
+    #[test]
+    fn parse_proc_mounts_tracks_target_and_options() {
+        let mounts = parse_proc_mounts("/dev/nvme0n1p1 /boot/efi vfat rw,nosuid,nodev 0 0\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].target, Path::new("/boot/efi"));
+        assert_eq!(mounts[0].options, vec!["rw", "nosuid", "nodev"]);
+    }
+
+    #[test]
+    fn unescape_mount_field_decodes_proc_escapes() {
+        assert_eq!(unescape_mount_field("/boot/My\\040ESP"), "/boot/My ESP");
     }
 }
