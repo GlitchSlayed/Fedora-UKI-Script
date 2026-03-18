@@ -3,7 +3,7 @@ use crate::cmd::CommandRunner;
 use crate::config::AppConfig;
 use crate::dracut::build_initramfs;
 use crate::efi::{
-    promote_current_boot_entry, register_boot_entry, schedule_one_time_boot, validate_esp_mount,
+    promote_current_boot_entry, register_boot_entry, schedule_one_time_boot, validate_esp_preflight,
 };
 use crate::kernel::{
     list_installed_kernels, prune_stale_uki_artifacts, resolve_cmdline, CmdlineSettings,
@@ -11,7 +11,6 @@ use crate::kernel::{
 use crate::ukify::{build_uki, UkifyParams};
 use anyhow::{Context, Result};
 use log::info;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Fully resolved runtime settings for generation.
@@ -79,15 +78,8 @@ pub fn generate(
     settings: &GenerateSettings,
     boot_once: bool,
 ) -> Result<(PathBuf, String)> {
-    validate_esp_mount(&settings.esp_path)?;
+    validate_esp_preflight(&settings.esp_path, &settings.output_dir)?;
     ensure_required_paths(settings)?;
-
-    fs::create_dir_all(&settings.output_dir).with_context(|| {
-        format!(
-            "failed creating UKI output directory {}",
-            settings.output_dir.display()
-        )
-    })?;
 
     let initramfs = PathBuf::from(format!("/tmp/initramfs-{}.img", settings.kernel_version));
     let kernel_image = PathBuf::from(format!("/lib/modules/{}/vmlinuz", settings.kernel_version));
@@ -149,6 +141,8 @@ pub fn install(
     settings: &GenerateSettings,
     boot_once: bool,
 ) -> Result<PathBuf> {
+    validate_esp_preflight(&settings.esp_path, &settings.output_dir)?;
+
     let (path, _boot_num) = generate(runner, cfg, settings, boot_once)?;
 
     let installed = list_installed_kernels(runner)?;
