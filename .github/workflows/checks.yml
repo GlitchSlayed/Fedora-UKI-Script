@@ -21,6 +21,7 @@ jobs:
           dnf install -y \
             bash \
             cargo \
+            clippy \
             gcc \
             coreutils \
             diffutils \
